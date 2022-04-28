@@ -18,6 +18,7 @@ def preprocess_text(text):
 
     return text
 
+
 def main(subreddit, object_type):
 
     count = 0
@@ -74,9 +75,10 @@ def main(subreddit, object_type):
                            
     handle.close()
 
-
-#subreddit = 'Forum_Democratie'
-subreddit = 'Poldersocialisme'
-#object_type = 'submission'
-object_type = 'comment'
-main(subreddit, object_type)
+if __name__ == '__main__':
+    #subreddit = 'Forum_Democratie'
+    subreddit = 'Poldersocialisme'
+    #object_type = 'submission'
+    object_type = 'comment'
+    
+    main(subreddit, object_type)

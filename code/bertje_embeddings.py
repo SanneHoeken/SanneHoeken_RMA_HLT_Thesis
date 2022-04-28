@@ -1,53 +1,29 @@
-from collections import defaultdict
-import torch, json, spacy, os.path
+import torch, json, spacy
 import numpy as np
 from transformers import AutoTokenizer, AutoModel
 from tqdm import tqdm
-from torch.utils.data import DataLoader, SequentialSampler
+from torch.utils.data import Dataset, DataLoader, SequentialSampler
 
 nlp = spacy.load("nl_core_news_sm", disable=['parser', 'ner'])
 
-def id_to_target(model, tokenizer, targets):
-    
-    unk_id = tokenizer.convert_tokens_to_ids('[UNK]')
-    targets_ids = [tokenizer.encode(t, add_special_tokens=False) for t in targets]
-    i2w = {}
-    for t, t_id in zip(targets, targets_ids):
-        if len(t_id) > 1 or (len(t_id) == 1 and t_id == unk_id):
-            if tokenizer.add_tokens([t]):
-                print(f"'{t}' is added to model's vocabulary")
-                model.resize_token_embeddings(len(tokenizer))
-                i2w[len(tokenizer) - 1] = t
-        else:
-            i2w[t_id[0]] = t
-    
-    return i2w
+def encode_sentence(sentence, targets, tokenizer):
+
+    # lemmatize and split compounds with targetword in it 
+    lemmas = [t.lemma_ for t in nlp(sentence)]
+    new_lemmas = []
+    for lemma in lemmas:
+        for target in targets:
+            if target in lemma:
+                lemma = lemma.replace(target, ' '+target+' ')
+                break
+        new_lemmas.append(lemma)
+    lemmas = " ".join(new_lemmas)
+    encoded = tokenizer.encode(lemmas, add_special_tokens=False)
+
+    return encoded
 
 
-def count_targets(i2w, tokenizer, sentences):
-    
-    target_counter = {i2w[target]: 0 for target in i2w}
-    for sentence in tqdm(sentences):
-        # lemmatize and split compounds with targetword in it 
-        lemmas = [t.lemma_ for t in nlp(sentence)]
-        new_lemmas = []
-        for lemma in lemmas:
-            for target in target_counter:
-                if target in lemma:
-                    lemma = lemma.replace(target, ' '+target+' ')
-                    break
-            new_lemmas.append(lemma)
-        lemmas = " ".join(new_lemmas)
-        encoded = tokenizer.encode(lemmas, add_special_tokens=False)
-        
-        for tok_id in encoded:
-            if tok_id in i2w:
-                target_counter[i2w[tok_id]] += 1
-        
-    return target_counter
-
-
-def get_context(token_ids, target_position, sequence_length):
+def get_encoded_context(token_ids, target_position, sequence_length):
     
     # -2 as [CLS] and [SEP] tokens will be added later; /2 as it's a one-sided window
     window_size = int((sequence_length - 2) / 2)
@@ -63,22 +39,44 @@ def get_context(token_ids, target_position, sequence_length):
     return context_ids, new_target_position
 
 
-class ContextsDataset(torch.utils.data.Dataset):
+class ContextsDataset(Dataset):
 
-    def __init__(self, targets_i2w, sentences, tokenizer, sequence_length):
+    def __init__(self, targets, sentences, tokenizer):
         super(ContextsDataset).__init__()
         self.data = []
-        self.tokenizer = tokenizer
-        self.CLS_id = tokenizer.encode('[CLS]', add_special_tokens=False)[0]
-        self.SEP_id = tokenizer.encode('[SEP]', add_special_tokens=False)[0]
+        self.textdata = dict()
+        self.context_length = tokenizer.model_max_length    
+        self.window_size = 10
+        
+        # Store vocabulary indices of target words and itialize counter
+        targets_ids = [tokenizer.encode(t, add_special_tokens=False) for t in targets]
+        i2w = {t_id[0]: t for t, t_id in zip(targets, targets_ids)}
+        self.target_counter = {i2w[target]: 0 for target in i2w}
+
+        CLS_id = tokenizer.encode('[CLS]', add_special_tokens=False)[0]
+        SEP_id = tokenizer.encode('[SEP]', add_special_tokens=False)[0]
 
         for sentence in tqdm(sentences, total=len(sentences)):
-            token_ids = tokenizer.encode(sentence, add_special_tokens=False)
+            token_ids = encode_sentence(sentence, targets, tokenizer)
             for spos, tok_id in enumerate(token_ids):
-                if tok_id in targets_i2w:
-                    context_ids, pos_in_context = get_context(token_ids, spos, sequence_length)
-                    input_ids = [self.CLS_id] + context_ids + [self.SEP_id]
-                    self.data.append((input_ids, targets_i2w[tok_id], pos_in_context))
+                if tok_id in i2w:
+                    # update counter
+                    self.target_counter[i2w[tok_id]] += 1
+
+                    # get encoded context
+                    context_ids, pos_in_context = get_encoded_context(token_ids, spos, self.context_length)
+                    input_ids = [CLS_id] + context_ids + [SEP_id]
+                    self.data.append((input_ids, i2w[tok_id], pos_in_context))
+
+                    # get textual context window per target
+                    words = sentence.split()
+                    lower = max(spos - self.window_size, 0)
+                    upper = min(spos + self.window_size, len(words))
+                    window = words[lower:spos] + words[spos+1:upper+1]
+                    if i2w[tok_id] not in self.textdata:
+                        self.textdata[i2w[tok_id]] = []
+                    self.textdata[i2w[tok_id]].append(window)
+
 
     def __len__(self):
         return len(self.data)
@@ -95,7 +93,7 @@ def set_seed(seed, n_gpus):
         torch.cuda.manual_seed_all(seed)
 
 
-def main(model_dir, output_path, targets_path, sentences_path, counter_path, batch_size, context_length):
+def main(model_dir, output_path, targets_path, sentences_path, contexts_path, batch_size):
 
     # Setup CUDA / GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -116,34 +114,26 @@ def main(model_dir, output_path, targets_path, sentences_path, counter_path, bat
     model = AutoModel.from_pretrained(model_dir, output_hidden_states=True)
     model.to(device)
 
-    # Store vocabulary indices of target words
-    i2w = id_to_target(model, tokenizer, targets)
+    # Dataset with all contexts of target words
+    dataset = ContextsDataset(targets, sentences, tokenizer)
     
-    # Count usages of target words
-    if os.path.exists(counter_path):
-        with open(counter_path, "r") as infile:
-            target_counter = json.load(infile)
-    else:
-        target_counter = count_targets(i2w, tokenizer, sentences)
-        with open(counter_path, "w") as outfile:
-            json.dump(target_counter, outfile)
-    
-    # Containers for usages
+    # Store contexts per target word in json
+    with open(contexts_path, "w") as outfile:
+        json.dump(dataset.textdata, outfile)
+
+    # Containers for usage representations
     nDims = model.config.hidden_size
     nLayers = model.config.num_hidden_layers
     
     usages = {target: np.empty((target_count, (nLayers + 1) * nDims))  
-        for (target, target_count) in target_counter.items()}
-    curr_idx = {target: 0 for target in target_counter}
-    
-    # Dataset with all contexts of target words
-    dataset = ContextsDataset(i2w, sentences, tokenizer, context_length)
-    sampler = SequentialSampler(dataset)
-    dataloader = DataLoader(dataset, sampler=sampler, batch_size=batch_size)
-    iterator = tqdm(dataloader, desc="Iteration")
+        for (target, target_count) in dataset.target_counter.items()}
+    curr_idx = {target: 0 for target in dataset.target_counter}
     
     # Iterate over sentences and collect representations
-    for step, batch in enumerate(iterator):
+    sampler = SequentialSampler(dataset)
+    dataloader = DataLoader(dataset, sampler=sampler, batch_size=batch_size)
+
+    for step, batch in enumerate(tqdm(dataloader)):
         model.eval()
         batch_tuple = tuple()
         for t in batch:
@@ -169,13 +159,10 @@ def main(model_dir, output_path, targets_path, sentences_path, counter_path, bat
 
             # store all usage representations (hidden layers) per target word in dictionary
             for b_id in np.arange(len(batch_input_ids)):
-                
                 lemma = batch_lemmas[b_id]
-
                 layers = [layer[b_id, batch_spos[b_id] + 1, :] for layer in hidden_states]
                 usage_vector = np.concatenate(layers)
                 usages[lemma][curr_idx[lemma], :] = usage_vector
-
                 curr_idx[lemma] += 1
 
     np.savez_compressed(output_path, **usages)
@@ -183,13 +170,18 @@ def main(model_dir, output_path, targets_path, sentences_path, counter_path, bat
     
     
 if __name__ == '__main__':
-    model_dir = "GroNLP/bert-base-dutch-cased"
-    output_path = '../output/bertje_embeddings_Forum_Democratie.npz'
-    sentences_path = '../data/subreddit_Forum_Democratie_comments.jsonl'
+
     targets_path = '../data/targets.txt'
-    counter_path = '../output/target_counts_Forum_Democratie.json'
-
+    model_dir = '../models/bertje-ft-all'
     batch_size = 8
-    context_length = 512
 
-    main(model_dir, output_path, targets_path, sentences_path, counter_path, batch_size, context_length)
+    for community, com in [('Poldersocialisme', 'PS'), 
+                            ('Forum_Democratie1', 'FD1'), 
+                            ('ForumDemocratie2', 'FD2')]:
+        
+        output_path = f'../output/embeddings/bertje-ft-all_embeddings_{com}.npz'
+        sentences_path = f'../data/subreddit_{community}_comments.jsonl'
+        contexts_path = f'../output/contexts/contexts_{com}.json'
+        
+        print('\n', community, '\n')
+        main(model_dir, output_path, targets_path, sentences_path, contexts_path, batch_size)
