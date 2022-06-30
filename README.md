@@ -1,7 +1,7 @@
 # Using Language Models for Analyzing Semantic Variation between Dutch Social Communities
 
 This is the repository for a thesis submitted in partial fulfilment of the requirements for the degree of MA Linguistics (Human Language Technology) at VU University Amsterdam.
-July 2022.
+June 2022.
 
 ### Project
 
